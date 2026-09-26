@@ -3,6 +3,8 @@ import pandas as pd
 
 from ai_analyzer import analyze_customer
 from excel_validator import validate_excel
+from sales_task import generate_sales_tasks
+from today_tasks import get_today_tasks
 
 
 st.set_page_config(
@@ -240,13 +242,11 @@ if uploaded_file is not None:
             results
         )
 
-        # 保存到Session State
         st.session_state["result_df"] = result_df
 
 
     # ==============================
-    # 如果已经完成AI分析
-    # 就显示分析结果
+    # 获取已经保存的分析结果
     # ==============================
 
     result_df = st.session_state["result_df"]
@@ -435,14 +435,32 @@ if uploaded_file is not None:
 
 
         # ==============================
+        # AI销售任务中心
+        # ==============================
+
+        st.subheader(
+            "🎯 AI销售任务中心"
+        )
+
+        task_df = generate_sales_tasks(
+            result_df
+        )
+
+        st.dataframe(
+            task_df,
+            use_container_width=True
+        )
+
+
+        # ==============================
         # 保存Excel
         # ==============================
 
         output_file = (
-            "day7_ai_lead_generation.xlsx"
+            "day9_ai_sales_tasks.xlsx"
         )
 
-        result_df.to_excel(
+        task_df.to_excel(
             output_file,
             index=False
         )
@@ -459,7 +477,7 @@ if uploaded_file is not None:
 
             st.download_button(
 
-                label="📥 下载AI获客分析结果",
+                label="📥 下载销售任务表",
 
                 data=file,
 
