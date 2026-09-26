@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+
 from ai_analyzer import analyze_customer
 from excel_validator import validate_excel
 
@@ -13,6 +14,14 @@ st.set_page_config(
 
 st.title("🤖 AI获客分析系统")
 st.write("上传客户Excel，AI自动分析客户价值并生成开发建议。")
+
+
+# ==============================
+# 初始化Session State
+# ==============================
+
+if "result_df" not in st.session_state:
+    st.session_state["result_df"] = None
 
 
 # ==============================
@@ -231,6 +240,19 @@ if uploaded_file is not None:
             results
         )
 
+        # 保存到Session State
+        st.session_state["result_df"] = result_df
+
+
+    # ==============================
+    # 如果已经完成AI分析
+    # 就显示分析结果
+    # ==============================
+
+    result_df = st.session_state["result_df"]
+
+
+    if result_df is not None:
 
         # ==============================
         # AI分析统计
@@ -302,80 +324,114 @@ if uploaded_file is not None:
         )
 
 
-       # ==============================
-# 客户开发邮件
-# ==============================
+        # ==============================
+        # 客户开发邮件
+        # ==============================
 
-st.subheader("📧 客户开发邮件")
+        st.subheader("📧 客户开发邮件")
 
-company_list = result_df["公司"].tolist()
+        company_list = result_df[
+            "公司"
+        ].tolist()
 
-selected_company = st.selectbox(
-    "请选择一个客户",
-    company_list
-)
+        selected_company = st.selectbox(
+            "请选择一个客户",
+            company_list
+        )
 
-selected_customer = result_df[
-    result_df["公司"] == selected_company
-].iloc[0]
-
-
-st.markdown("### 👤 客户信息")
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.write(
-        f"**公司：** {selected_customer['公司']}"
-    )
-
-with col2:
-    st.write(
-        f"**国家：** {selected_customer['国家']}"
-    )
-
-with col3:
-    st.write(
-        f"**客户评分：** {selected_customer['客户评分']}"
-    )
+        selected_customer = result_df[
+            result_df["公司"] == selected_company
+        ].iloc[0]
 
 
-st.markdown("### 🎯 客户开发策略")
+        # ==============================
+        # 客户信息
+        # ==============================
 
-st.write(
-    selected_customer["开发策略"]
-)
+        st.markdown(
+            "### 👤 客户信息"
+        )
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+
+            st.write(
+                f"**公司：** "
+                f"{selected_customer['公司']}"
+            )
+
+        with col2:
+
+            st.write(
+                f"**国家：** "
+                f"{selected_customer['国家']}"
+            )
+
+        with col3:
+
+            st.write(
+                f"**客户评分：** "
+                f"{selected_customer['客户评分']}"
+            )
 
 
-st.markdown("### ✉️ 邮件主题")
+        # ==============================
+        # 客户开发策略
+        # ==============================
 
-st.text_input(
-    "邮件主题",
-    value=selected_customer["邮件主题"],
-    key="email_subject"
-)
+        st.markdown(
+            "### 🎯 客户开发策略"
+        )
 
-
-st.markdown("### 📝 英文开发邮件")
-
-st.text_area(
-    "邮件正文",
-    value=selected_customer["邮件正文"],
-    height=300,
-    key="email_body"
-)
+        st.write(
+            selected_customer["开发策略"]
+        )
 
 
-# ==============================
-# AI分析结果
-# ==============================
+        # ==============================
+        # 邮件主题
+        # ==============================
 
-st.subheader("AI分析结果")
+        st.markdown(
+            "### ✉️ 邮件主题"
+        )
 
-st.dataframe(
-    result_df,
-    use_container_width=True
-)
+        st.text_input(
+            "邮件主题",
+            value=selected_customer["邮件主题"],
+            key="email_subject_preview"
+        )
+
+
+        # ==============================
+        # 英文开发邮件
+        # ==============================
+
+        st.markdown(
+            "### 📝 英文开发邮件"
+        )
+
+        st.text_area(
+            "邮件正文",
+            value=selected_customer["邮件正文"],
+            height=300,
+            key="email_body_preview"
+        )
+
+
+        # ==============================
+        # AI分析结果
+        # ==============================
+
+        st.subheader(
+            "AI分析结果"
+        )
+
+        st.dataframe(
+            result_df,
+            use_container_width=True
+        )
 
 
         # ==============================
