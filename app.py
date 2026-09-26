@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from ai_analyzer import analyze_customer
+from excel_validator import validate_excel
 
 
 st.set_page_config(
@@ -26,8 +27,15 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
 
-    df = pd.read_excel(uploaded_file)
+    # 检查Excel格式
+    is_valid, message, df = validate_excel(uploaded_file)
 
+    if not is_valid:
+
+        st.error(message)
+        st.stop()
+
+    st.success(message)
     st.success(f"成功读取 {len(df)} 个客户")
 
     st.subheader("客户数据预览")
