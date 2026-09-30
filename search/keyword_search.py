@@ -1,9 +1,15 @@
 from search.search_config import SearchConfig
+from search.search_engine import SearchEngine
 
 
 class KeywordSearch:
-    def __init__(self, config: SearchConfig):
+    def __init__(
+        self,
+        config: SearchConfig,
+        search_engine: SearchEngine
+    ):
         self.config = config
+        self.search_engine = search_engine
 
     def build_query(self):
         parts = []
@@ -25,22 +31,17 @@ class KeywordSearch:
 
         return " ".join(parts)
 
+    def search(self, limit=10):
+        query = self.build_query()
+
+        return self.search_engine.search(
+            query,
+            limit=limit
+        )
+
     def show_search_query(self):
         query = self.build_query()
 
         print("========== 企业搜索 ==========")
         print(f"搜索关键词：{query}")
         print("==============================")
-
-
-if __name__ == "__main__":
-    config = SearchConfig(
-        keyword="industrial automation",
-        country="Germany",
-        industry="Industrial Equipment",
-        city="Munich",
-        company_size="50-500"
-    )
-
-    search = KeywordSearch(config)
-    search.show_search_query()
