@@ -6,3 +6,4 @@ day6_ai_sales_action.xlsx
 __pycache__/
 *.xlsx
 database/crm.db
+search/cache/
