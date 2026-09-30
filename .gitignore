@@ -5,3 +5,4 @@ day6_customer_priority.xlsx
 day6_ai_sales_action.xlsx
 __pycache__/
 *.xlsx
+database/crm.db
