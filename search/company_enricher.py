@@ -2,6 +2,9 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 
+from search.company_contact_extractor import CompanyContactExtractor
+from search.company_record import CompanyRecord
+
 
 class CompanyEnricher:
     """
@@ -40,6 +43,7 @@ class CompanyEnricher:
 
     def __init__(self, timeout=20):
         self.timeout = timeout
+        self.contact_extractor = CompanyContactExtractor()
 
     def fetch_homepage(self, url):
         response = requests.get(
@@ -91,6 +95,21 @@ class CompanyEnricher:
         for link in links:
             text = link["text"].strip().lower()
             url = link["url"].strip().lower()
+
+            parsed_url = urlparse(url)
+
+            # 排除网站首页及多语言首页，例如 /、/en/、/de/
+            path_parts = [
+                part
+                for part in parsed_url.path.strip("/").split("/")
+                if part
+            ]
+
+            if len(path_parts) == 0:
+                continue
+
+            if len(path_parts) == 1 and len(path_parts[0]) <= 5:
+                continue
 
             if not classified["contact_page"]:
                 if self._matches_page(
@@ -205,3 +224,50 @@ class CompanyEnricher:
         target_domain = urlparse(target_url).netloc.lower()
 
         return base_domain == target_domain
+    def enrich(self, company_name, url, source=""):
+        """
+        从企业官网生成企业记录。
+        """
+
+        homepage_html = self.fetch_homepage(url)
+
+        links = self.discover_links(
+            url,
+            homepage_html
+        )
+
+        pages = self.classify_links(links)
+
+        contact_data = {
+            "email": "",
+            "phone": "",
+            "address": "",
+            "contact": ""
+        }
+
+        contact_page = pages["contact_page"]
+
+        if contact_page:
+            try:
+                contact_html = self.fetch_homepage(
+                    contact_page
+                )
+
+                contact_data = self.contact_extractor.extract(
+                    contact_html
+                )
+
+            except requests.RequestException:
+                pass
+
+        return CompanyRecord(
+            company_name=company_name,
+            contact=contact_data["contact"],
+            phone=contact_data["phone"],
+            email=contact_data["email"],
+            address=contact_data["address"],
+            contact_page=contact_page,
+            jobs_page=pages["jobs_page"],
+            news=pages["news_page"],
+            source=source
+        )
