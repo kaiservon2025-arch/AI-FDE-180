@@ -7,3 +7,4 @@ __pycache__/
 *.xlsx
 database/crm.db
 search/cache/
+.venv/
