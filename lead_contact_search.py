@@ -1,13 +1,56 @@
+
+# lead_contact_search.py
+# 第1/5段
+
 import os
 import re
 import requests
+
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
+from search.search_service import web_search
 
 load_dotenv()
 
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-TAVILY_URL = "https://api.tavily.com/search"
+# ============================================================
+# 常量配置
+# ============================================================
+
+THIRD_PARTY_DOMAINS = {
+    "smeok.com",
+    "qcc.com",
+    "tianyancha.com",
+    "aiqicha.baidu.com",
+    "xinnet.com",
+    "11467.com",
+    "hc360.com",
+    "made-in-china.com",
+    "alibaba.com",
+    "1688.com",
+}
+
+THIRD_PARTY_EMAIL_DOMAINS = {
+    "qq.com",
+    "163.com",
+    "126.com",
+    "sina.com",
+    "sina.com.cn",
+    "gmail.com",
+    "hotmail.com",
+    "outlook.com",
+}
+
+BAD_CONTACT_NAMES = {
+    "联系我们",
+    "联系方式",
+    "联系电话",
+    "公司地址",
+    "客户服务",
+    "服务热线",
+    "售后服务",
+    "业务联系",
+}
 
 
 # ============================================================
@@ -20,22 +63,10 @@ def normalize_text(value):
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
-def normalize_list(value):
-    if value is None:
-        return []
-
-    if isinstance(value, str):
-        parts = re.split(r"[,，、;\n]+", value)
-        return [normalize_text(x) for x in parts if normalize_text(x)]
-
-    return [normalize_text(x) for x in value if normalize_text(x)]
-
-
 def normalize_company_name(company_name):
-    text = normalize_text(company_name).lower()
+    """生成用于匹配的标准化企业名称，不用于覆盖原始名称。"""
 
-    text = re.sub(r"（.*?）", "", text)
-    text = re.sub(r"\(.*?\)", "", text)
+    text = normalize_text(company_name).lower()
 
     suffixes = [
         "集团有限公司",
@@ -44,19 +75,107 @@ def normalize_company_name(company_name):
         "有限公司",
         "集团",
         "公司",
-        "co.,ltd.",
         "co., ltd.",
+        "co.,ltd.",
         "limited",
         "ltd.",
-        "ltd",
     ]
 
     for suffix in suffixes:
         text = text.replace(suffix.lower(), "")
 
-    text = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", text)
+    text = re.sub(r"[（）()【】\[\]]", "", text)
 
-    return text
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", text)
+
+
+def clean_company_name_for_contact_search(company_name):
+    """清理常见摘要前缀和后缀，并过滤明显不是具体企业的描述。"""
+
+    name = normalize_text(company_name)
+
+    if not name:
+        return ""
+
+    prefixes = [
+        "分别是",
+        "可以联系",
+        "公司简介",
+        "企业简介",
+        "公司名称：",
+        "企业名称：",
+        "公司名称:",
+        "企业名称:",
+        "来自东莞的",
+    ]
+
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if name.startswith(prefix):
+                name = name[len(prefix):].strip()
+                changed = True
+
+    # 清理搜索结果标题附带的官网说明
+    name = re.sub(
+        r"\s*[\|｜]\s*(官网|官方网站|官方网页|official website).*$",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    if not name:
+        return ""
+
+    # 明确的企业类别、名单、排名或泛化描述
+    invalid_phrases = [
+        "东莞的台资企业",
+        "世界500强企业",
+        "台资企业",
+        "外资企业",
+        "民营企业",
+        "企业名单",
+        "公司排名",
+        "企业排名",
+        "制造企业名单",
+    ]
+
+    if any(phrase in name for phrase in invalid_phrases):
+        return ""
+
+    generic_descriptions = {
+        "企业",
+        "公司",
+        "厂家",
+        "供应商",
+        "电子企业",
+        "制造企业",
+        "工业企业",
+        "科技企业",
+        "机械企业",
+        "东莞的电子企业",
+        "深圳的电子企业",
+        "广州的电子企业",
+    }
+
+    if name in generic_descriptions:
+        return ""
+
+    # 不把明显残留的地区描述当成企业名称
+    if name.startswith(("东莞的", "深圳的", "广州的")):
+        return ""
+
+    if not re.search(r"[A-Za-z\u4e00-\u9fff]", name):
+        return ""
+
+    return name
+
+
+def is_valid_company_name(company_name):
+    """统一的企业名称有效性判断。"""
+
+    return bool(clean_company_name_for_contact_search(company_name))
 
 
 def company_keywords(company_name):
@@ -65,776 +184,418 @@ def company_keywords(company_name):
     if not normalized:
         return []
 
-    keywords = [normalized]
+    result = [normalized]
 
     if len(normalized) >= 4:
-        keywords.append(normalized[:4])
+        result.append(normalized[:4])
 
     if len(normalized) >= 5:
-        keywords.append(normalized[:5])
+        result.append(normalized[:5])
 
-    return list(dict.fromkeys(keywords))
+    return list(dict.fromkeys(result))
 
 
-# ============================================================
-# Tavily
-# ============================================================
+def get_url_host(url):
+    url = normalize_text(url).lower()
 
-def tavily_search(query, max_results=8):
+    match = re.match(r"^https?://([^/:?#]+)", url)
 
-    if not TAVILY_API_KEY:
-        raise RuntimeError(
-            "没有找到 TAVILY_API_KEY，请检查 .env 文件。"
-        )
+    if not match:
+        return ""
 
-    payload = {
-        "api_key": TAVILY_API_KEY,
-        "query": query,
-        "search_depth": "advanced",
-        "max_results": max_results,
-        "include_answer": False,
-        "include_raw_content": True,
-    }
+    return match.group(1).removeprefix("www.")
 
-    response = requests.post(
-        TAVILY_URL,
-        json=payload,
-        timeout=60
+
+def is_third_party_domain(url):
+    host = get_url_host(url)
+
+    return any(
+        host == domain or host.endswith("." + domain)
+        for domain in THIRD_PARTY_DOMAINS
     )
 
-    response.raise_for_status()
 
-    data = response.json()
+# ============================================================
+# Tavily 搜索
+# ============================================================
 
-    return data.get("results", [])
+def searxng_contact_search(query, max_results=3):
+    """使用现有 SearXNG 搜索服务，返回兼容联系人提取流程的结果。"""
+    results = web_search(query=query, limit=max_results)
+    compatible_results = []
+
+    for result in results:
+        compatible_results.append({
+            "title": result.get("title", ""),
+            "url": result.get("url", ""),
+            "content": result.get("content", result.get("description", "")),
+            "raw_content": result.get("raw_content", ""),
+            "source": result.get("source", "searxng"),
+        })
+
+    return compatible_results
 
 
 # ============================================================
-# 来源类型
+# 来源判断
 # ============================================================
 
 def detect_source_type(title, url, content=""):
+    text = (
+        normalize_text(title)
+        + " "
+        + normalize_text(url)
+        + " "
+        + normalize_text(content)
+    ).lower()
 
-    text = f"{title} {url} {content}".lower()
-
-    if "招聘" in text or "job" in text or "career" in text:
-        return "招聘网站"
-
-    if "linkedin" in text or "脉脉" in text:
-        return "职业社交"
-
-    if "微信" in text or "weixin" in text or "公众号" in text:
-        return "微信公众号"
-
-    if "招标" in text or "采购" in text or "bid" in text:
-        return "招投标/采购"
-
-    if "展会" in text or "conference" in text or "expo" in text:
-        return "展会/会议"
-
-    if (
-        "政府" in text
-        or "gov.cn" in text
-        or "协会" in text
-        or "产业园" in text
-    ):
-        return "政府/协会/产业园"
-
-    if url.lower().endswith(".pdf") or ".pdf?" in url.lower():
-        return "PDF/公开资料"
+    if is_third_party_domain(url):
+        return "第三方目录"
 
     if any(
-        x in text
-        for x in [
-            "新闻",
-            "news",
-            "媒体",
-            "新浪",
-            "网易",
-            "腾讯",
-            "搜狐",
-        ]
+        word in text
+        for word in ["客户案例", "建站案例", "网站建设案例"]
     ):
-        return "新闻/媒体"
+        return "第三方案例"
 
-    if (
-        "官网" in text
-        or "联系我们" in text
-        or "contact" in text.lower()
+    if any(
+        word in text
+        for word in ["contact", "联系我们", "联系方式", "联络我们"]
     ):
-        return "企业官网"
+        return "联系方式页面"
 
-    return "其他公开网页"
+    if any(
+        word in text
+        for word in ["about us", "公司简介", "关于我们"]
+    ):
+        return "企业介绍"
 
+    if any(
+        word in text
+        for word in ["global", "全球据点", "海外办公室"]
+    ):
+        return "全球据点"
+
+    return "其他网页"
 
 # ============================================================
-# 企业归属验证
+# 企业匹配
 # ============================================================
 
-def verify_company_match(
-    company_name,
-    title,
-    content,
-    url
-):
-
+def verify_company_match(company_name, title, content, url):
     target = normalize_company_name(company_name)
 
     if not target:
-        return False, "目标企业名称为空"
+        return False, "企业名称为空"
 
     title_norm = normalize_company_name(title)
     content_norm = normalize_company_name(content)
     url_norm = normalize_company_name(url)
 
     if target in title_norm:
-        return True, "页面标题明确出现目标企业"
+        return True, "标题包含企业名称"
 
     if target in content_norm:
-        return True, "页面内容明确出现目标企业"
+        return True, "内容包含企业名称"
 
     if target in url_norm:
-        return True, "网址中明确出现目标企业"
+        return True, "网址包含企业名称"
 
-    keywords = company_keywords(company_name)
+    for keyword in company_keywords(company_name):
+        if len(keyword) >= 4:
+            if keyword in title_norm:
+                return True, "标题包含关键词:" + keyword
 
-    for keyword in keywords:
+            if keyword in content_norm:
+                return True, "内容包含关键词:" + keyword
 
-        if len(keyword) < 4:
-            continue
-
-        if keyword in title_norm:
-            return True, f"页面标题出现企业核心名称：{keyword}"
-
-        if keyword in content_norm:
-            return True, f"页面内容出现企业核心名称：{keyword}"
-
-        if keyword in url_norm:
-            return True, f"网址出现企业核心名称：{keyword}"
-
-    return False, "页面没有发现目标企业的明确归属证据"
+    return False, "没有企业归属"
 
 
 # ============================================================
-# 第三方联系方式排除
+# 邮箱处理
 # ============================================================
-
-THIRD_PARTY_EMAIL_DOMAINS = {
-    "tianyancha.com",
-    "xinnet.com",
-    "qcc.com",
-    "baidu.com",
-    "sina.com.cn",
-    "sohu.com",
-    "qq.com",
-    "163.com",
-    "126.com",
-    "aliyun.com",
-    "alibaba-inc.com",
-    "tencent.com",
-    "microsoft.com",
-    "google.com",
-    "gmail.com",
-    "outlook.com",
-    "hotmail.com",
-    "linkedin.com",
-}
-
 
 def get_email_domain(email):
-
     email = normalize_text(email).lower()
 
     if "@" not in email:
         return ""
 
-    return email.split("@", 1)[1]
+    return email.split("@")[-1]
 
 
-def is_third_party_email(email):
-
+def is_free_email(email):
     domain = get_email_domain(email)
+    return domain in THIRD_PARTY_EMAIL_DOMAINS
 
-    if not domain:
-        return False
-
-    if domain in THIRD_PARTY_EMAIL_DOMAINS:
-        return True
-
-    return False
-
-
-def email_matches_company_domain(
-    email,
-    company_name,
-    url
-):
-
-    domain = get_email_domain(email)
-
-    if not domain:
-        return False
-
-    company_words = company_keywords(company_name)
-
-    clean_domain = re.sub(
-        r"[^a-z0-9]",
-        "",
-        domain.lower()
-    )
-
-    for word in company_words:
-
-        clean_word = re.sub(
-            r"[^a-z0-9]",
-            "",
-            word.lower()
-        )
-
-        if (
-            clean_word
-            and len(clean_word) >= 4
-            and clean_word in clean_domain
-        ):
-            return True
-
-    # URL 域名匹配
-    url_match = re.search(
-        r"https?://(?:www\.)?([^/]+)",
-        url.lower()
-    )
-
-    if url_match:
-
-        site_domain = re.sub(
-            r"[^a-z0-9]",
-            "",
-            url_match.group(1)
-        )
-
-        if (
-            clean_domain
-            and site_domain
-            and (
-                clean_domain in site_domain
-                or site_domain in clean_domain
-            )
-        ):
-            return True
-
-    return False
-
-
-# ============================================================
-# 邮箱
-# ============================================================
 
 def extract_emails(text):
-
     if not text:
         return []
 
     pattern = (
-        r"\b[A-Za-z0-9._%+-]+"
-        r"@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+        r"[A-Za-z0-9._%+-]+"
+        r"@"
+        r"[A-Za-z0-9.-]+"
+        r"\."
+        r"[A-Za-z]{2,}"
     )
 
-    emails = re.findall(
-        pattern,
-        text
-    )
+    emails = re.findall(pattern, text)
 
-    result = []
-
-    for email in emails:
-
-        email = email.strip().lower()
-
-        if any(
-            x in email
-            for x in [
-                "example.com",
-                "example.cn",
-                "test.com",
-            ]
-        ):
-            continue
-
-        if email not in result:
-            result.append(email)
-
-    return result
+    return list(dict.fromkeys(x.lower() for x in emails))
 
 
 # ============================================================
-# 电话
+# 电话提取
 # ============================================================
 
 def extract_phones(text):
-
     if not text:
         return []
 
+    patterns = [
+        r"(?<!\d)1[3-9]\d{9}(?!\d)",
+        r"(?<!\d)(?:020|0755|0769|0760)\d{7,8}(?!\d)",
+    ]
+
     result = []
 
-    mobile_pattern = (
-        r"(?<!\d)1[3-9]\d{9}(?!\d)"
-    )
+    for pattern in patterns:
+        phones = re.findall(pattern, text)
 
-    mobiles = re.findall(
-        mobile_pattern,
-        text
-    )
-
-    for phone in mobiles:
-
-        if phone not in result:
-            result.append(phone)
-
-    landline_pattern = (
-        r"(?<!\d)"
-        r"(?:020|0660|0662|0663|0751|0752|0753|0754|0755|0756|"
-        r"0757|0758|0759|0760|0762|0763|0766|0768|0769)"
-        r"\d{7,8}"
-        r"(?!\d)"
-    )
-
-    landlines = re.findall(
-        landline_pattern,
-        text
-    )
-
-    for phone in landlines:
-
-        if phone not in result:
-            result.append(phone)
+        for phone in phones:
+            if phone not in result:
+                result.append(phone)
 
     return result
 
 
 # ============================================================
-# 联系人
+# 联系人提取
 # ============================================================
 
 def extract_contact_names(text):
-
     if not text:
         return []
 
-    result = []
-
     patterns = [
-
-        # 联系人：洪先生
-        r"(?:联系人|联络人|负责人)"
-        r"\s*[:：]\s*"
-        r"([\u4e00-\u9fff]{2,4})"
-        r"(?:先生|女士|小姐)?",
-
-        # 洪先生 / 洪女士
-        r"([\u4e00-\u9fff]{2,4})"
-        r"(?:先生|女士|小姐)",
-
+        r"(?:联系人|负责人|业务联系人)\s*[:：]?\s*([\u4e00-\u9fff]{2,4})",
+        r"([\u4e00-\u9fff]{2,4})(?:先生|女士|小姐)",
     ]
 
+    result = []
+
     for pattern in patterns:
+        names = re.findall(pattern, text)
 
-        matches = re.findall(
-            pattern,
-            text,
-            re.IGNORECASE
-        )
-
-        for name in matches:
-
-            name = normalize_text(name)
-
-            # ------------------------------------------------
-            # 排除明显不是人名的词
-            # ------------------------------------------------
-
-            invalid_names = {
-                "联络方式",
-                "联系方式",
-                "联系方法",
-                "联系我们",
-                "联系电话",
-                "联络我们",
-                "客户服务",
-                "客服中心",
-                "服务热线",
-                "销售团队",
-                "公司地址",
-                "电子邮箱",
-            }
-
-            if name in invalid_names:
+        for name in names:
+            if name in BAD_CONTACT_NAMES:
                 continue
 
-            if name.endswith(
-                (
-                    "方式",
-                    "方法",
-                    "电话",
-                    "邮箱",
-                    "地址",
-                    "我们",
-                )
-            ):
-                continue
-
-            if (
-                len(name) >= 2
-                and name not in result
-            ):
+            if name not in result:
                 result.append(name)
 
     return result
 
 
 # ============================================================
-# 职位
+# 企业邮箱判断
 # ============================================================
 
-def extract_job_titles(text):
+def email_matches_company_domain(email, company_name):
+    domain = get_email_domain(email)
 
-    if not text:
-        return []
+    if not domain:
+        return False
 
-    titles = [
-        "董事长",
-        "总经理",
-        "副总经理",
-        "总裁",
-        "副总裁",
-        "CEO",
-        "CFO",
-        "CTO",
-        "COO",
-        "HR总监",
-        "人力资源总监",
-        "人事总监",
-        "人力资源经理",
-        "人事经理",
-        "行政经理",
-        "招聘经理",
-        "招聘负责人",
-        "HR经理",
-        "HRBP",
-        "人力资源负责人",
-        "销售总监",
-        "销售经理",
-        "市场总监",
-        "市场经理",
-        "采购经理",
-        "招商主管",
-        "总监",
-        "经理",
-    ]
+    clean_domain = re.sub(r"[^a-z0-9]", "", domain.lower())
 
-    result = []
-
-    for title in titles:
-
-        if title.lower() in text.lower():
-
-            if title not in result:
-                result.append(title)
-
-    return result
-
-
-# ============================================================
-# 信息日期
-# ============================================================
-
-def extract_information_date(text):
-
-    if not text:
-        return ""
-
-    patterns = [
-        r"(20\d{2}[年/-]\d{1,2}[月/-]\d{1,2}[日]?)",
-        r"(20\d{2}[./-]\d{1,2}[./-]\d{1,2})",
-        r"(20\d{2}年\d{1,2}月)",
-        r"(20\d{2}年)",
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text
+    for keyword in company_keywords(company_name):
+        clean_keyword = re.sub(
+            r"[^a-z0-9]",
+            "",
+            keyword.lower(),
         )
 
-        if match:
-            return match.group(1)
+        if len(clean_keyword) >= 4:
+            if clean_keyword in clean_domain:
+                return True
 
-    return ""
+    return False
 
 
 # ============================================================
-# 判断联系方式是否属于目标企业
+# 联系方式评分
 # ============================================================
 
-def verify_contact_ownership(
+def contact_score(
     company_name,
     email,
     phone,
     title,
+    url,
     content,
-    url
 ):
+    score = 0
 
-    # --------------------------------------------------------
-    # 邮箱判断
-    # --------------------------------------------------------
+    source = detect_source_type(title, url, content)
+
+    if source == "联系方式页面":
+        score += 40
+    elif source == "企业介绍":
+        score += 25
+    elif source == "全球据点":
+        score += 5
+    elif source == "第三方目录":
+        score -= 40
+
+    normalized_company = normalize_company_name(company_name)
+    normalized_title = normalize_company_name(title)
+
+    if normalized_company and normalized_company in normalized_title:
+        score += 25
 
     if email:
-
-        if is_third_party_email(email):
-
-            return (
-                False,
-                "第三方平台/公共邮箱，不作为企业联系方式"
-            )
-
-        if email_matches_company_domain(
-            email,
-            company_name,
-            url
-        ):
-
-            return (
-                True,
-                "邮箱域名与目标企业/官网域名存在关联"
-            )
-
-        # 企业官网页面明确出现邮箱
-        if (
-            normalize_company_name(company_name)
-            in normalize_company_name(content)
-            and email.lower() in content.lower()
-        ):
-
-            return (
-                True,
-                "企业页面明确展示该邮箱"
-            )
-
-        # 企业官网页面
-        source_type = detect_source_type(
-            title,
-            url,
-            content
-        )
-
-        if source_type == "企业官网":
-
-            return (
-                True,
-                "企业官网页面公开展示该邮箱"
-            )
-
-        # 普通邮箱但没有企业域名证据
-        return (
-            True,
-            "目标企业公开页面中出现该邮箱，暂未发现第三方平台归属"
-        )
-
-    # --------------------------------------------------------
-    # 电话判断
-    # --------------------------------------------------------
+        if email_matches_company_domain(email, company_name):
+            score += 40
+        elif is_free_email(email):
+            score -= 15
+        else:
+            score += 10
 
     if phone:
+        score += 15
 
-        if (
-            normalize_company_name(company_name)
-            in normalize_company_name(content)
-        ):
+    return score
 
-            return (
-                True,
-                "企业公开页面明确展示该电话"
-            )
+# ============================================================
+# 联系方式生成
+# ============================================================
 
-        return (
-            True,
-            "目标企业公开搜索结果中出现该电话"
-        )
-
-    return (
-        False,
-        "没有有效联系方式"
+def build_contact_record(
+    company_name,
+    contact_name,
+    email,
+    phone,
+    title,
+    url,
+    content,
+    reason,
+):
+    score = contact_score(
+        company_name,
+        email,
+        phone,
+        title,
+        url,
+        content,
     )
+
+    if score >= 65:
+        status = "高可信候选"
+        why = "高可信，需要人工最终确认"
+    else:
+        status = "待人工核实"
+        why = "评分不足，需要人工确认"
+
+    return {
+        "企业名称": company_name,
+        "联系人": contact_name,
+        "邮箱": email,
+        "电话": phone,
+        "评分": score,
+        "匹配依据": reason,
+        "联系方式依据": why,
+        "联系方式状态": status,
+        "来源类型": detect_source_type(title, url, content),
+        "来源": title,
+        "网址": url,
+        "抓取时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
 # ============================================================
-# 联系方式候选提取
+# 联系方式提取
 # ============================================================
 
 def extract_contact_candidates(
     company_name,
     title,
     content,
-    url
+    url,
 ):
+    # 防止无效名称从其他调用路径进入提取流程
+    company_name = clean_company_name_for_contact_search(
+        company_name
+    )
 
-    title = normalize_text(title)
-    content = normalize_text(content)
-    url = normalize_text(url)
+    if not company_name:
+        return []
 
-    matched, company_reason = verify_company_match(
+    matched, reason = verify_company_match(
         company_name,
         title,
         content,
-        url
+        url,
     )
 
     if not matched:
         return []
 
-    combined_text = (
-        f"{title}\n{content}"
-    )
+    text = title + "\n" + content + "\n" + url
 
-    emails = extract_emails(
-        combined_text
-    )
+    emails = extract_emails(text)
+    phones = extract_phones(text)
+    names = extract_contact_names(text)
 
-    phones = extract_phones(
-        combined_text
-    )
+    contact_name = names[0] if names else ""
 
-    names = extract_contact_names(
-        combined_text
-    )
-
-    job_titles = extract_job_titles(
-        combined_text
-    )
-
-    information_date = extract_information_date(
-        combined_text
-    )
-
-    source_type = detect_source_type(
-        title,
-        url,
-        content
-    )
-
-    candidates = []
-
-    # --------------------------------------------------------
-    # 联系人只取真正识别出的名字
-    # --------------------------------------------------------
-
-    contact_name = ""
-
-    if names:
-        contact_name = names[0]
-
-    # --------------------------------------------------------
-    # 不再默认把职位绑定到所有联系方式
-    #
-    # 只有页面同时存在明确联系人时，才暂时绑定职位。
-    # --------------------------------------------------------
-
-    job_title = ""
-
-    if contact_name and job_titles:
-        job_title = job_titles[0]
-
-    # --------------------------------------------------------
-    # 邮箱
-    # --------------------------------------------------------
+    records = []
 
     for email in emails:
-
-        owned, ownership_reason = verify_contact_ownership(
-            company_name=company_name,
-            email=email,
-            phone="",
-            title=title,
-            content=content,
-            url=url
+        records.append(
+            build_contact_record(
+                company_name,
+                contact_name,
+                email,
+                "",
+                title,
+                url,
+                content,
+                reason,
+            )
         )
-
-        if not owned:
-            continue
-
-        candidates.append({
-            "企业名称": company_name,
-            "联系人": contact_name,
-            "职位": job_title,
-            "邮箱": email,
-            "电话": "",
-            "企业匹配状态": "已确认",
-            "联系方式状态": "已确认",
-            "联系方式归属依据": ownership_reason,
-            "匹配依据": company_reason,
-            "来源类型": source_type,
-            "来源": title,
-            "网址": url,
-            "信息日期": information_date,
-            "抓取时间": datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-        })
-
-    # --------------------------------------------------------
-    # 电话
-    # --------------------------------------------------------
 
     for phone in phones:
-
-        owned, ownership_reason = verify_contact_ownership(
-            company_name=company_name,
-            email="",
-            phone=phone,
-            title=title,
-            content=content,
-            url=url
+        records.append(
+            build_contact_record(
+                company_name,
+                contact_name,
+                "",
+                phone,
+                title,
+                url,
+                content,
+                reason,
+            )
         )
 
-        if not owned:
-            continue
-
-        candidates.append({
-            "企业名称": company_name,
-            "联系人": contact_name,
-            "职位": job_title,
-            "邮箱": "",
-            "电话": phone,
-            "企业匹配状态": "已确认",
-            "联系方式状态": "已确认",
-            "联系方式归属依据": ownership_reason,
-            "匹配依据": company_reason,
-            "来源类型": source_type,
-            "来源": title,
-            "网址": url,
-            "信息日期": information_date,
-            "抓取时间": datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-        })
-
-    return candidates
+    return records
 
 
 # ============================================================
-# 联系方式去重
+# 去重
 # ============================================================
 
 def deduplicate_contacts(records):
-
     unique = {}
 
     for record in records:
-
-        company = normalize_text(
+        company = normalize_company_name(
             record.get("企业名称", "")
+            or record.get("公司名称", "")
         )
 
         email = normalize_text(
@@ -845,60 +606,39 @@ def deduplicate_contacts(records):
             record.get("电话", "")
         )
 
-        contact = normalize_text(
-            record.get("联系人", "")
-        )
-
         if email:
-
-            key = (
-                normalize_company_name(company),
-                "email",
-                email,
-            )
-
+            key = (company, "email", email)
         elif phone:
-
-            key = (
-                normalize_company_name(company),
-                "phone",
-                phone,
-            )
-
+            key = (company, "phone", phone)
         else:
+            # 纯客户资料不在此函数中保留；
+            # CRM 合并函数会单独保留没有联系人的客户
+            continue
 
-            key = (
-                normalize_company_name(company),
-                "other",
-                contact,
-            )
+        old = unique.get(key)
 
-        if key not in unique:
-
+        if (
+            old is None
+            or record.get("评分", 0) > old.get("评分", 0)
+        ):
             unique[key] = record
 
-        else:
-
-            old = unique[key]
-
-            for field in [
-                "联系人",
-                "职位",
-                "信息日期",
-                "来源类型",
-                "来源",
-                "网址",
-                "匹配依据",
-                "联系方式归属依据",
-            ]:
-
-                if (
-                    not old.get(field)
-                    and record.get(field)
-                ):
-                    old[field] = record[field]
-
     return list(unique.values())
+
+
+# ============================================================
+# 排序
+# ============================================================
+
+def rank_contacts(records):
+    if not records:
+        return []
+
+    return sorted(
+        records,
+        key=lambda item: item.get("评分", 0),
+        reverse=True,
+    )
 
 
 # ============================================================
@@ -906,331 +646,277 @@ def deduplicate_contacts(records):
 # ============================================================
 
 def build_contact_queries(company_name):
-
     return [
-        f'"{company_name}" 联系方式 电话 邮箱',
-        f'"{company_name}" 联系人 手机',
-        f'"{company_name}" 总经理 联系方式',
-        f'"{company_name}" 人事 HR 联系方式',
-        f'"{company_name}" 招聘 联系人',
-        f'"{company_name}" 官网 联系我们',
-        f'"{company_name}" 新闻 联系方式',
-        f'"{company_name}" 招投标 联系人',
-        f'"{company_name}" 展会 联系人',
+        f'"{company_name}" 联系方式',
+        f'"{company_name}" 联系电话 邮箱',
+        f'"{company_name}" 联系我们',
+        f'"{company_name}" sales email',
+        f'"{company_name}" 官网',
     ]
 
-
 # ============================================================
-# 单企业联系方式搜索
+# 单企业搜索
 # ============================================================
 
 def search_company_contacts(
     company_name,
-    max_results_per_query=5
+    max_results_per_query=3,
+    max_results=None,
 ):
-
-    all_records = []
-
-    queries = build_contact_queries(
+    if max_results is not None:
+        max_results_per_query = max_results
+    # 所有调用入口统一验证企业名称
+    company_name = clean_company_name_for_contact_search(
         company_name
     )
 
-    for query in queries:
+    if not company_name:
+        print("跳过无效企业名称，不执行联系人搜索")
+        return []
 
-        try:
+    queries = build_contact_queries(company_name)
+    all_records = []
 
-            results = tavily_search(
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        tasks = {
+            executor.submit(
+                searxng_contact_search,
                 query,
-                max_results=max_results_per_query
-            )
+                max_results_per_query,
+            ): query
+            for query in queries
+        }
 
-        except Exception as e:
+        for future in as_completed(tasks):
+            query = tasks[future]
 
-            print(
-                f"搜索失败：{query}"
-            )
+            try:
+                search_results = future.result()
+            except Exception as e:
+                print("搜索失败:", query, e)
+                continue
 
-            print(
-                f"错误：{e}"
-            )
+            for result in search_results:
+                title = normalize_text(result.get("title", ""))
+                content = normalize_text(result.get("content", ""))
+                raw_content = normalize_text(
+                    result.get("raw_content", "")
+                )
+                url = normalize_text(result.get("url", ""))
 
-            continue
+                full_content = content + "\n" + raw_content
 
-        for result in results:
-
-            title = normalize_text(
-                result.get("title", "")
-            )
-
-            content = normalize_text(
-                result.get("content", "")
-            )
-
-            raw_content = normalize_text(
-                result.get("raw_content", "")
-            )
-
-            url = normalize_text(
-                result.get("url", "")
-            )
-
-            if raw_content:
-
-                full_content = (
-                    f"{content}\n{raw_content}"
+                records = extract_contact_candidates(
+                    company_name,
+                    title,
+                    full_content,
+                    url,
                 )
 
-            else:
+                all_records.extend(records)
 
-                full_content = content
-
-            candidates = extract_contact_candidates(
-                company_name=company_name,
-                title=title,
-                content=full_content,
-                url=url,
-            )
-
-            all_records.extend(
-                candidates
-            )
-
-    return deduplicate_contacts(
-        all_records
+    return rank_contacts(
+        deduplicate_contacts(all_records)
     )
 
 
 # ============================================================
-# 批量搜索
+# 批量搜索 CRM 客户
 # ============================================================
 
 def search_contacts_for_leads(
     leads,
-    max_results_per_query=5
+    max_results_per_query=3,
 ):
+    if hasattr(leads, "to_dict"):
+        leads = leads.to_dict("records")
 
     results = []
+    total = len(leads)
 
-    if hasattr(leads, "to_dict"):
-        leads = leads.to_dict(
-            "records"
-        )
-
-    for index, lead in enumerate(
-        leads,
-        start=1
-    ):
-
-        company_name = normalize_text(
+    for index, lead in enumerate(leads, start=1):
+        original_name = (
             lead.get("企业名称")
-            or lead.get("company")
             or lead.get("公司名称")
             or ""
         )
 
+        company_name = clean_company_name_for_contact_search(
+            original_name
+        )
+
         if not company_name:
+            print(
+                f"[{index}/{total}] 跳过无效企业名称："
+                f"{normalize_text(original_name)}"
+            )
             continue
 
         print(
-            f"\n[{index}/{len(leads)}]"
-            f" 正在搜索联系方式："
-            f"{company_name}"
+            f"\n[{index}/{total}] "
+            f"搜索联系方式：{company_name}"
         )
 
         contacts = search_company_contacts(
             company_name,
-            max_results_per_query=
-                max_results_per_query
+            max_results_per_query,
         )
 
         for contact in contacts:
+            item = dict(lead)
+            item.update(contact)
+            results.append(item)
 
-            merged = dict(lead)
+        high_count = sum(
+            1
+            for contact in contacts
+            if contact.get("联系方式状态") == "高可信候选"
+        )
 
-            merged.update(contact)
-
-            results.append(
-                merged
-            )
+        pending_count = sum(
+            1
+            for contact in contacts
+            if contact.get("联系方式状态") == "待人工核实"
+        )
 
         print(
-            f"找到已确认联系方式："
-            f"{len(contacts)} 条"
+            f"候选联系方式：{len(contacts)} 条；"
+            f"高可信：{high_count} 条；"
+            f"待核实：{pending_count} 条"
         )
 
     return results
 
 
 # ============================================================
-# 合并联系方式
+# 合并客户资料
 # ============================================================
 
-def merge_contacts_to_leads(
-    leads,
-    contacts
-):
+def merge_contacts_to_leads(leads, contacts):
+    """合并联系人和客户资料，保留所有原始客户记录。"""
 
     if hasattr(leads, "to_dict"):
-        leads = leads.to_dict(
-            "records"
-        )
+        leads = leads.to_dict("records")
 
     if hasattr(contacts, "to_dict"):
-        contacts = contacts.to_dict(
-            "records"
-        )
+        contacts = contacts.to_dict("records")
+
+    # 仅对联系人数据去重，不对最终 CRM 客户记录做去重
+    contacts = deduplicate_contacts(contacts)
 
     contact_map = {}
 
     for contact in contacts:
-
-        company = normalize_company_name(
-            contact.get(
-                "企业名称",
-                ""
-            )
+        contact_name = (
+            contact.get("企业名称")
+            or contact.get("公司名称")
+            or ""
         )
 
-        if not company:
-            continue
+        key = normalize_company_name(contact_name)
 
-        contact_map.setdefault(
-            company,
-            []
-        ).append(contact)
+        if key:
+            contact_map.setdefault(key, []).append(contact)
 
-    final_records = []
+    result = []
 
     for lead in leads:
-
-        company_name = normalize_text(
+        original_name = (
             lead.get("企业名称")
-            or lead.get("company")
             or lead.get("公司名称")
             or ""
         )
 
-        normalized_company = normalize_company_name(
-            company_name
-        )
-
-        matched_contacts = contact_map.get(
-            normalized_company,
-            []
-        )
+        key = normalize_company_name(original_name)
+        matched_contacts = contact_map.get(key, [])
 
         if not matched_contacts:
+            # 没有找到联系人时，仍然保留原始客户
+            result.append(dict(lead))
             continue
 
         for contact in matched_contacts:
+            item = dict(lead)
+            item.update(contact)
 
-            merged = dict(lead)
+            # 优先保留 CRM 原始企业名称，避免名称被搜索结果覆盖
+            if lead.get("企业名称"):
+                item["企业名称"] = lead["企业名称"]
+            elif lead.get("公司名称"):
+                item["公司名称"] = lead["公司名称"]
 
-            merged.update(contact)
+            result.append(item)
 
-            final_records.append(
-                merged
-            )
-
-    return deduplicate_contacts(
-        final_records
-    )
-
+    return result
 
 # ============================================================
-# 测试
+# 测试入口
 # ============================================================
 
 if __name__ == "__main__":
-
-    test_company = (
-        "东莞市联诚电子科技有限公司"
-    )
+    company = "东莞市联诚电子科技有限公司"
 
     print("=" * 60)
-    print("联系方式搜索测试")
-    print("=" * 60)
-
-    print()
+    print("测试企业：", company)
     print(
-        f"企业：{test_company}"
+        "搜索开始时间：",
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
 
-    records = search_company_contacts(
-        test_company,
-        max_results_per_query=5
-    )
+    records = search_company_contacts(company)
 
     print(
-        f"找到已确认联系方式："
-        f"{len(records)} 条"
+        "\n搜索结束时间：",
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
-
-    print("-" * 60)
+    print("最终联系方式数量:", len(records))
 
     for record in records:
+        print("-" * 40)
+        print(record)
 
-        print(
-            f"联系人："
-            f"{record.get('联系人', '')}"
-        )
 
-        print(
-            f"职位："
-            f"{record.get('职位', '')}"
-        )
+# ============================================================
+# 文件输出工具（后续网页端使用）
+# ============================================================
 
-        print(
-            f"邮箱："
-            f"{record.get('邮箱', '')}"
-        )
+def save_contacts_to_excel(
+    records,
+    filename="contact_results.xlsx",
+):
+    try:
+        import pandas as pd
 
-        print(
-            f"电话："
-            f"{record.get('电话', '')}"
-        )
+        df = pd.DataFrame(records)
+        df.to_excel(filename, index=False)
 
-        print(
-            f"企业匹配："
-            f"{record.get('企业匹配状态', '')}"
-        )
+        print("已保存:", filename)
 
-        print(
-            f"联系方式状态："
-            f"{record.get('联系方式状态', '')}"
-        )
+    except Exception as e:
+        print("保存失败:", e)
 
-        print(
-            f"联系方式归属依据："
-            f"{record.get('联系方式归属依据', '')}"
-        )
 
-        print(
-            f"匹配依据："
-            f"{record.get('匹配依据', '')}"
-        )
+# ============================================================
+# 网页端调用接口
+# ============================================================
 
-        print(
-            f"来源类型："
-            f"{record.get('来源类型', '')}"
-        )
+def run_contact_search(company_name):
+    cleaned_name = clean_company_name_for_contact_search(
+        company_name
+    )
 
-        print(
-            f"来源："
-            f"{record.get('来源', '')}"
-        )
+    if not cleaned_name:
+        return {
+            "company": normalize_text(company_name),
+            "count": 0,
+            "contacts": [],
+            "error": "企业名称无效，未执行搜索",
+        }
 
-        print(
-            f"网址："
-            f"{record.get('网址', '')}"
-        )
+    records = search_company_contacts(cleaned_name)
 
-        print(
-            f"信息日期："
-            f"{record.get('信息日期', '')}"
-        )
-
-        print("-" * 60)
-
-    print()
-    print("测试完成")
+    return {
+        "company": cleaned_name,
+        "count": len(records),
+        "contacts": records,
+    }

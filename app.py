@@ -7,6 +7,63 @@ import lead_contact_search
 
 
 # ============================================================
+# CRM 数据库
+# ============================================================
+
+from database.crm_manager import (
+    get_all_companies,
+    save_company,
+    update_status,
+)
+
+
+# ============================================================
+# 页面配置
+# ============================================================
+
+st.set_page_config(
+    page_title="亦行 AI",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ============================================================
+# Session State
+# ============================================================
+
+if "leads_df" not in st.session_state:
+
+    try:
+
+        crm_data = get_all_companies()
+
+        st.session_state.leads_df = pd.DataFrame(
+            crm_data
+        )
+
+    except Exception:
+
+        st.session_state.leads_df = pd.DataFrame()
+
+
+if "selected_company" not in st.session_state:
+    st.session_state.selected_company = ""
+
+
+if "search_history" not in st.session_state:
+    st.session_state.search_history = []
+
+
+if "saved_tasks" not in st.session_state:
+    st.session_state.saved_tasks = []
+
+
+if "page" not in st.session_state:
+    st.session_state.page = "工作台"
+
+# ============================================================
 # 页面配置
 # ============================================================
 
@@ -787,19 +844,23 @@ def final_clean(
         )
 
         # 只有识别出员工数量的才严格过滤
+        # 无法识别员工数量的企业继续保留
+        # Keep companies with unknown employee counts.
+        # Known counts must satisfy both configured bounds.
         known_mask = employee_series.notna()
+        within_range = pd.Series(True, index=df.index)
 
         if employee_min > 0:
-            df = df[
-                (~known_mask)
-                | (employee_series >= employee_min)
-            ]
+            within_range &= employee_series >= employee_min
 
         if employee_max > 0:
-            df = df[
-                (~known_mask)
-                | (employee_series <= employee_max)
-            ]
+            within_range &= employee_series <= employee_max
+
+        employee_mask = (~known_mask) | (
+            known_mask & within_range
+        )
+
+        df = df.loc[employee_mask].copy()
 
     # --------------------------------------------------------
     # 联系方式筛选
@@ -1288,11 +1349,11 @@ if st.session_state.page == "工作台":
         )
 
     else:
-
         st.markdown("### 最近线索")
 
         display_columns = [
             "企业名称",
+            "省份",
             "城市",
             "行业",
             "员工数量",
@@ -1300,6 +1361,11 @@ if st.session_state.page == "工作台":
             "职位",
             "邮箱",
             "电话",
+            "企业关键词命中",
+            "搜索关键词",
+            "来源",
+            "来源类型",
+            "来源网址",
             "需求关键词",
             "状态",
         ]
@@ -1311,9 +1377,7 @@ if st.session_state.page == "工作台":
         ]
 
         st.dataframe(
-            df[
-                display_columns
-            ].head(10),
+            df[display_columns].head(10),
             use_container_width=True,
             hide_index=True,
         )

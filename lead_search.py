@@ -4,11 +4,30 @@ import requests
 from datetime import datetime
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
+from search.search_service import web_search
 
 load_dotenv()
 
 
-TAVILY_URL = "https://api.tavily.com/search"
+def searxng_search(query: str, max_results: int = 10):
+    """
+    ???? SearXNG ?????????????????????
+    ?? title?url?content?source????????????
+    """
+    results = web_search(query=query, limit=max_results)
+
+    compatible_results = []
+
+    for result in results:
+        compatible_results.append({
+            "title": result.get("title", ""),
+            "url": result.get("url", ""),
+            "content": result.get("description", ""),
+            "source": result.get("source", "searxng"),
+        })
+
+    return compatible_results
+
 
 
 def normalize_list(value):
@@ -250,44 +269,6 @@ def detect_source_type(url, title="", content=""):
         return "PDF/公开资料"
 
     return "其他公开网页"
-
-
-def tavily_search(
-    query: str,
-    max_results: int = 10,
-    search_depth: str = "advanced",
-):
-    """
-    直接调用 Tavily HTTP API。
-    不使用 tavily-python SDK，避免 SDK 编码兼容问题。
-    """
-    api_key = os.getenv("TAVILY_API_KEY", "").strip()
-
-    if not api_key:
-        raise RuntimeError(
-            "没有找到 TAVILY_API_KEY，请检查 .env 文件。"
-        )
-
-    payload = {
-        "api_key": api_key,
-        "query": query,
-        "search_depth": search_depth,
-        "max_results": max_results,
-        "include_answer": False,
-        "include_raw_content": False,
-    }
-
-    response = requests.post(
-        TAVILY_URL,
-        json=payload,
-        timeout=60,
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    return data.get("results", [])
 
 
 def build_enterprise_queries(
@@ -700,7 +681,7 @@ def search_enterprises(
     for query in queries:
 
         try:
-            search_results = tavily_search(
+            search_results = searxng_search(
                 query=query,
                 max_results=max_results_per_query,
             )
@@ -807,7 +788,7 @@ def search_demand_signals(
     for query in queries:
 
         try:
-            search_results = tavily_search(
+            search_results = searxng_search(
                 query=query,
                 max_results=min(10, limit),
             )
